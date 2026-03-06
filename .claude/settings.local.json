@@ -3,7 +3,9 @@
     "allow": [
       "Bash(go build:*)",
       "Bash(~/bin/swag init:*)",
-      "Bash(timeout 120 ~/bin/swag init:*)"
+      "Bash(timeout 120 ~/bin/swag init:*)",
+      "Bash(go test:*)",
+      "Bash(ls:*)"
     ]
   }
 }

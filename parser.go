@@ -143,7 +143,18 @@ type Parser struct {
 	RequiredByDefault bool
 
 	// structStack stores full names of the structures that were already parsed or are being parsed now
+	// DEPRECATED in parallel mode: use parsingState instead
 	structStack []*TypeSpecDef
+
+	// parsingState tracks which goroutines are currently parsing each type.
+	// Used for recursion detection and synchronization in parallel parsing mode.
+	// Maps typeSpecDef -> goroutine ID. If a goroutine tries to parse a type it's already
+	// parsing, that's recursion. If a different goroutine is parsing, we wait.
+	parsingState map[*TypeSpecDef]uint64
+
+	// parsingCond is a condition variable used to signal when a type finishes parsing.
+	// Goroutines wait on this when they need a type that's being parsed by another goroutine.
+	parsingCond *sync.Cond
 
 	// markdownFileDir holds the path to the folder, where markdown files are stored
 	markdownFileDir string
@@ -267,11 +278,13 @@ func New(options ...func(*Parser)) *Parser {
 		debug:              log.New(os.Stdout, "", log.LstdFlags),
 		parsedSchemas:      make(map[*TypeSpecDef]*Schema),
 		outputSchemas:      make(map[*TypeSpecDef]*Schema),
+		parsingState:       make(map[*TypeSpecDef]uint64),
 		excludes:           make(map[string]struct{}),
 		tags:               make(map[string]struct{}),
 		fieldParserFactory: newTagBaseFieldParser,
 		Overrides:          make(map[string]string),
 	}
+	parser.parsingCond = sync.NewCond(&parser.structStackMu)
 
 	for _, option := range options {
 		option(parser)
@@ -1396,17 +1409,68 @@ func (parser *Parser) getRefTypeSchema(typeSpecDef *TypeSpecDef, schema *Schema)
 	return refSchema
 }
 
+// getGoroutineID extracts the goroutine ID from the runtime stack trace
+func getGoroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// Stack trace format: "goroutine 123 [running]:"
+	// Parse the goroutine ID from this string
+	var id uint64
+	fmt.Sscanf(string(buf[:n]), "goroutine %d", &id)
+	return id
+}
+
 func (parser *Parser) isInStructStack(typeSpecDef *TypeSpecDef) bool {
 	parser.structStackMu.Lock()
 	defer parser.structStackMu.Unlock()
 
-	for _, specDef := range parser.structStack {
-		if typeSpecDef == specDef {
-			return true
-		}
-	}
+	// Check if current goroutine is parsing this type (true recursion)
+	currentGID := getGoroutineID()
+	parsingGID, isBeingParsed := parser.parsingState[typeSpecDef]
+	
+	return isBeingParsed && parsingGID == currentGID
+}
 
+// enterStructParsing marks that the current goroutine is parsing this type.
+// Must be called with structStackMu already locked.
+func (parser *Parser) enterStructParsing(typeSpecDef *TypeSpecDef) {
+	currentGID := getGoroutineID()
+	parser.parsingState[typeSpecDef] = currentGID
+}
+
+// waitForTypeOrStart checks if another goroutine is parsing this type or if we're starting.
+// Returns true if we should proceed with parsing, false if we should return a reference.
+func (parser *Parser) waitForTypeOrStart(typeSpecDef *TypeSpecDef) bool {
+	parser.structStackMu.Lock()
+	defer parser.structStackMu.Unlock()
+	
+	currentGID := getGoroutineID()
+	
+	parsingGID, isBeingParsed := parser.parsingState[typeSpecDef]
+	if !isBeingParsed {
+		// Type is not being parsed, mark that we're starting and proceed
+		parser.parsingState[typeSpecDef] = currentGID
+		return true
+	}
+	if parsingGID == currentGID {
+		// Current goroutine is already parsing this (true recursion)
+		return false
+	}
+	
+	// Another goroutine is parsing this type. Don't wait (to avoid deadlocks from
+	// circular dependencies), just return false to create a reference.
 	return false
+}
+
+func (parser *Parser) exitStructParsing(typeSpecDef *TypeSpecDef) {
+	parser.structStackMu.Lock()
+	defer parser.structStackMu.Unlock()
+	
+	// Remove this type from parsing state
+	delete(parser.parsingState, typeSpecDef)
+	
+	// Notify all waiting goroutines that this type is done
+	parser.parsingCond.Broadcast()
 }
 
 // ParseDefinition parses given type spec that corresponds to the type under
@@ -1415,47 +1479,73 @@ func (parser *Parser) isInStructStack(typeSpecDef *TypeSpecDef) bool {
 func (parser *Parser) ParseDefinition(typeSpecDef *TypeSpecDef) (*Schema, error) {
 	typeName := typeSpecDef.TypeName()
 	
+	// Check if already fully parsed (fast path with read lock)
 	parser.parsedSchemasMu.RLock()
 	schema, found := parser.parsedSchemas[typeSpecDef]
 	parser.parsedSchemasMu.RUnlock()
 	
 	if found {
 		parser.debug.Printf("Skipping '%s', already parsed.", typeName)
-
 		return schema, nil
 	}
 
-	if parser.isInStructStack(typeSpecDef) {
+	// Wait if another goroutine is parsing this type, or mark that we're starting.
+	// This handles both recursion detection and coordination between goroutines.
+	shouldParse := parser.waitForTypeOrStart(typeSpecDef)
+	if !shouldParse {
+		// Either recursion was detected or another goroutine finished parsing
+		// Check if it was fully parsed by the other goroutine
+		parser.parsedSchemasMu.RLock()
+		schema, found := parser.parsedSchemas[typeSpecDef]
+		parser.parsedSchemasMu.RUnlock()
+		
+		if found {
+			parser.debug.Printf("Skipping '%s', already parsed.", typeName)
+			return schema, nil
+		}
+		
+		// Must be recursion
 		parser.debug.Printf("Skipping '%s', recursion detected.", typeName)
 
-		// Ensure SchemaName is set before using it
-		typeSpecDef.SetSchemaName()
-		schemaName := typeName
-		if typeSpecDef.SchemaName != "" {
-			schemaName = typeSpecDef.SchemaName
+		// For recursion case, compute schema name without modifying shared typeSpecDef
+		// Read SchemaName once to avoid races
+		existingSchemaName := typeSpecDef.SchemaName
+		recursionSchemaName := typeName
+		if existingSchemaName != "" {
+			recursionSchemaName = existingSchemaName
+		} else {
+			// Compute what SetSchemaName would have set, without calling it
+			if alias := typeSpecDef.Alias(); alias != "" {
+				recursionSchemaName = alias
+			} else {
+				recursionSchemaName = typeSpecDef.TypeName()
+			}
 		}
 
 		return &Schema{
-				Name:    schemaName,
+				Name:    recursionSchemaName,
 				PkgPath: typeSpecDef.PkgPath,
 				Schema:  PrimitiveSchema(OBJECT),
 			},
 			ErrRecursiveParseStruct
 	}
+	
+	// We're now marked as parsing this type, make sure to clean up when done
+	defer parser.exitStructParsing(typeSpecDef)
 
-	if parser.UseStructName {
-		schemaName := strings.Split(typeSpecDef.SchemaName, ".")
-		if len(schemaName) > 1 {
-			typeSpecDef.SchemaName = schemaName[len(schemaName)-1]
-			typeName = typeSpecDef.SchemaName
+	// Use a local variable for schemaName to avoid race conditions on shared typeSpecDef
+	schemaName := typeName
+	if parser.UseStructName && typeSpecDef.SchemaName != "" {
+		parts := strings.Split(typeSpecDef.SchemaName, ".")
+		if len(parts) > 1 {
+			schemaName = parts[len(parts)-1]
+			typeName = schemaName
 		} else {
 			parser.debug.Printf("Could not strip type name of %s", typeName)
 		}
+	} else if typeSpecDef.SchemaName != "" {
+		schemaName = typeSpecDef.SchemaName
 	}
-
-	parser.structStackMu.Lock()
-	parser.structStack = append(parser.structStack, typeSpecDef)
-	parser.structStackMu.Unlock()
 
 	parser.debug.Printf("Generating %s", typeName)
 
@@ -1494,12 +1584,7 @@ func (parser *Parser) ParseDefinition(typeSpecDef *TypeSpecDef) (*Schema, error)
 		}
 	}
 
-	schemaName := typeName
-
-	if typeSpecDef.SchemaName != "" {
-		schemaName = typeSpecDef.SchemaName
-	}
-
+	// schemaName was already set earlier in the function based on UseStructName flag
 	sch := Schema{
 		Name:    schemaName,
 		PkgPath: typeSpecDef.PkgPath,
