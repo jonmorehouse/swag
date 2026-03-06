@@ -3072,17 +3072,26 @@ func TestApiParseTag(t *testing.T) {
 		t.Error("Number of tags did not match")
 	}
 
-	dogs := p.swagger.Tags[0]
-	if dogs.TagProps.Name != "dogs" || dogs.TagProps.Description != "Dogs are cool" {
+	// Find tags by name (tags are now sorted alphabetically for determinism)
+	var dogs, cats *spec.Tag
+	for i := range p.swagger.Tags {
+		switch p.swagger.Tags[i].Name {
+		case "dogs":
+			dogs = &p.swagger.Tags[i]
+		case "cats":
+			cats = &p.swagger.Tags[i]
+		}
+	}
+
+	if dogs == nil || dogs.TagProps.Name != "dogs" || dogs.TagProps.Description != "Dogs are cool" {
 		t.Error("Failed to parse dogs name or description")
 	}
 
-	cats := p.swagger.Tags[1]
-	if cats.TagProps.Name != "cats" || cats.TagProps.Description != "Cats are the devil" {
+	if cats == nil || cats.TagProps.Name != "cats" || cats.TagProps.Description != "Cats are the devil" {
 		t.Error("Failed to parse cats name or description")
 	}
 
-	if cats.TagProps.ExternalDocs.URL != "https://google.de" || cats.TagProps.ExternalDocs.Description != "google is super useful to find out that cats are evil!" {
+	if cats != nil && (cats.TagProps.ExternalDocs.URL != "https://google.de" || cats.TagProps.ExternalDocs.Description != "google is super useful to find out that cats are evil!") {
 		t.Error("URL: ", cats.TagProps.ExternalDocs.URL)
 		t.Error("Description: ", cats.TagProps.ExternalDocs.Description)
 		t.Error("Failed to parse cats external documentation")

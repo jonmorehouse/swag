@@ -15,9 +15,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/KyleBanks/depth"
 	"github.com/go-openapi/spec"
@@ -191,6 +193,26 @@ type Parser struct {
 
 	// UseStructName Dont use those ugly full-path names when using dependency flag
 	UseStructName bool
+
+	// pathsMu protects concurrent writes to swagger.Paths.Paths during parallel parsing
+	pathsMu sync.Mutex
+
+	// definitionsMu protects concurrent writes to swagger.Definitions during parallel parsing
+	definitionsMu sync.Mutex
+
+	// outputMu protects concurrent access to parser.outputSchemas and parser.swagger.Definitions maps.
+	// These must be protected together to maintain consistency between the two maps.
+	// Uses RWMutex to allow concurrent reads while protecting writes.
+	outputMu sync.RWMutex
+
+	// structStackMu protects concurrent access to parser.structStack slice during parallel parsing.
+	// Note: structStack is inherently problematic in parallel parsing as it tracks recursion depth
+	// per goroutine, but is currently shared across all goroutines. This mutex prevents data races
+	// but the recursion detection may not work correctly across parallel parsing contexts.
+	structStackMu sync.Mutex
+
+	// parsedSchemasMu protects concurrent access to parser.parsedSchemas map during parallel parsing.
+	parsedSchemasMu sync.RWMutex
 }
 
 // FieldParserFactory create FieldParser.
@@ -404,6 +426,15 @@ func (parser *Parser) skipPackageByPrefix(pkgpath string) bool {
 
 // ParseAPIMultiSearchDir is like ParseAPI but for multiple search dirs.
 func (parser *Parser) ParseAPIMultiSearchDir(searchDirs []string, mainAPIFile string, parseDepth int) error {
+	return parser.ParseAPIMultiSearchDirWithConcurrency(searchDirs, mainAPIFile, parseDepth, 0)
+}
+
+// ParseAPIMultiSearchDirWithConcurrency allows controlling file-level parallelism during operation parsing.
+// maxFileParallelism values:
+//   0 = sequential (default, backward compatible)
+//  -1 = auto (uses runtime.GOMAXPROCS(0))
+//   N = limit to N concurrent files
+func (parser *Parser) ParseAPIMultiSearchDirWithConcurrency(searchDirs []string, mainAPIFile string, parseDepth int, maxFileParallelism int) error {
 	absMainAPIFilePath, err := filepath.Abs(filepath.Join(searchDirs[0], mainAPIFile))
 	if err != nil {
 		return err
@@ -489,12 +520,31 @@ func (parser *Parser) ParseAPIMultiSearchDir(searchDirs []string, mainAPIFile st
 		return err
 	}
 
-	err = parser.packages.RangeFiles(parser.ParseRouterAPIInfo)
+	// Phase 2: Operation parsing (parallelizable)
+	if maxFileParallelism > 0 || maxFileParallelism == -1 {
+		concurrency := maxFileParallelism
+		if concurrency == -1 {
+			concurrency = runtime.GOMAXPROCS(0)
+		}
+		err = parser.packages.RangeFilesParallel(parser.ParseRouterAPIInfo, concurrency)
+	} else {
+		// maxFileParallelism == 0: sequential (default)
+		err = parser.packages.RangeFiles(parser.ParseRouterAPIInfo)
+	}
 	if err != nil {
 		return err
 	}
 
-	return parser.checkOperationIDUniqueness()
+	if err := parser.checkOperationIDUniqueness(); err != nil {
+		return err
+	}
+
+	// Sort tags by name for deterministic output
+	sort.Slice(parser.swagger.Tags, func(i, j int) bool {
+		return parser.swagger.Tags[i].Name < parser.swagger.Tags[j].Name
+	})
+
+	return nil
 }
 
 func getPkgName(searchDir string) (string, error) {
@@ -1181,6 +1231,9 @@ func refRouteMethodOp(item *spec.PathItem, method string) (op **spec.Operation) 
 
 func processRouterOperation(parser *Parser, operation *Operation) error {
 	for _, routeProperties := range operation.RouterProperties {
+		// Lock for thread-safe access to paths map during parallel parsing
+		parser.pathsMu.Lock()
+		
 		var (
 			pathItem spec.PathItem
 			ok       bool
@@ -1195,12 +1248,14 @@ func processRouterOperation(parser *Parser, operation *Operation) error {
 
 		// check if we already have an operation for this path and method
 		if *op != nil {
+			parser.pathsMu.Unlock()
 			err := fmt.Errorf("route %s %s is declared multiple times", routeProperties.HTTPMethod, routeProperties.Path)
 			if parser.Strict {
 				return err
 			}
 
 			parser.debug.Printf("warning: %s\n", err)
+			parser.pathsMu.Lock()
 		}
 
 		if len(operation.RouterProperties) > 1 {
@@ -1224,6 +1279,8 @@ func processRouterOperation(parser *Parser, operation *Operation) error {
 		}
 
 		parser.swagger.Paths.Paths[routeProperties.Path] = pathItem
+		
+		parser.pathsMu.Unlock()
 	}
 
 	return nil
@@ -1290,7 +1347,10 @@ func (parser *Parser) getTypeSchema(typeName string, file *ast.File, ref bool) (
 
 	parser.packages.CheckTypeSpec(typeSpecDef)
 
+	parser.parsedSchemasMu.RLock()
 	schema, ok := parser.parsedSchemas[typeSpecDef]
+	parser.parsedSchemasMu.RUnlock()
+
 	if !ok {
 		var err error
 
@@ -1316,6 +1376,10 @@ func (parser *Parser) getTypeSchema(typeName string, file *ast.File, ref bool) (
 }
 
 func (parser *Parser) getRefTypeSchema(typeSpecDef *TypeSpecDef, schema *Schema) *spec.Schema {
+	// Lock for thread-safe access to outputSchemas and definitions during parallel parsing
+	parser.outputMu.Lock()
+	defer parser.outputMu.Unlock()
+	
 	_, ok := parser.outputSchemas[typeSpecDef]
 	if !ok {
 		parser.swagger.Definitions[schema.Name] = spec.Schema{}
@@ -1333,6 +1397,9 @@ func (parser *Parser) getRefTypeSchema(typeSpecDef *TypeSpecDef, schema *Schema)
 }
 
 func (parser *Parser) isInStructStack(typeSpecDef *TypeSpecDef) bool {
+	parser.structStackMu.Lock()
+	defer parser.structStackMu.Unlock()
+
 	for _, specDef := range parser.structStack {
 		if typeSpecDef == specDef {
 			return true
@@ -1347,7 +1414,11 @@ func (parser *Parser) isInStructStack(typeSpecDef *TypeSpecDef) bool {
 // with a schema for the given type
 func (parser *Parser) ParseDefinition(typeSpecDef *TypeSpecDef) (*Schema, error) {
 	typeName := typeSpecDef.TypeName()
+	
+	parser.parsedSchemasMu.RLock()
 	schema, found := parser.parsedSchemas[typeSpecDef]
+	parser.parsedSchemasMu.RUnlock()
+	
 	if found {
 		parser.debug.Printf("Skipping '%s', already parsed.", typeName)
 
@@ -1382,7 +1453,9 @@ func (parser *Parser) ParseDefinition(typeSpecDef *TypeSpecDef) (*Schema, error)
 		}
 	}
 
+	parser.structStackMu.Lock()
 	parser.structStack = append(parser.structStack, typeSpecDef)
+	parser.structStackMu.Unlock()
 
 	parser.debug.Printf("Generating %s", typeName)
 
@@ -1432,13 +1505,18 @@ func (parser *Parser) ParseDefinition(typeSpecDef *TypeSpecDef) (*Schema, error)
 		PkgPath: typeSpecDef.PkgPath,
 		Schema:  definition,
 	}
+	
+	parser.parsedSchemasMu.Lock()
 	parser.parsedSchemas[typeSpecDef] = &sch
+	parser.parsedSchemasMu.Unlock()
 
 	// update an empty schema as a result of recursion
+	parser.outputMu.Lock()
 	s2, found := parser.outputSchemas[typeSpecDef]
 	if found {
 		parser.swagger.Definitions[s2.Name] = *definition
 	}
+	parser.outputMu.Unlock()
 
 	return &sch, nil
 }
@@ -1750,7 +1828,10 @@ func (parser *Parser) getUnderlyingSchema(schema *spec.Schema) *spec.Schema {
 	if url := schema.Ref.GetURL(); url != nil {
 		if pos := strings.LastIndexByte(url.Fragment, '/'); pos >= 0 {
 			name := url.Fragment[pos+1:]
-			if schema, ok := parser.swagger.Definitions[name]; ok {
+			parser.outputMu.RLock()
+			schema, ok := parser.swagger.Definitions[name]
+			parser.outputMu.RUnlock()
+			if ok {
 				return &schema
 			}
 		}
@@ -2023,9 +2104,12 @@ func (parser *Parser) GetSwagger() *spec.Swagger {
 func (parser *Parser) addTestType(typename string) {
 	typeDef := &TypeSpecDef{}
 	parser.packages.uniqueDefinitions[typename] = typeDef
+	
+	parser.parsedSchemasMu.Lock()
 	parser.parsedSchemas[typeDef] = &Schema{
 		PkgPath: "",
 		Name:    typename,
 		Schema:  PrimitiveSchema(OBJECT),
 	}
+	parser.parsedSchemasMu.Unlock()
 }

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/packages"
 )
@@ -134,6 +135,42 @@ func (pkgDefs *PackagesDefinitions) RangeFiles(handle func(info *AstFileInfo) er
 	}
 
 	return nil
+}
+
+// RangeFilesParallel processes files concurrently with configurable concurrency limit.
+// Files are still sorted alphabetically before processing to ensure deterministic output.
+func (pkgDefs *PackagesDefinitions) RangeFilesParallel(handle func(info *AstFileInfo) error, maxConcurrency int) error {
+	// Collect and sort files (same as RangeFiles for determinism)
+	sortedFiles := make([]*AstFileInfo, 0, len(pkgDefs.files))
+	for _, info := range pkgDefs.files {
+		// ignore package path prefix with 'vendor' or $GOROOT,
+		// because the router info of api will not be included these files.
+		if strings.HasPrefix(info.PackagePath, "vendor") || (runtime.GOROOT() != "" && strings.HasPrefix(info.Path, runtime.GOROOT()+string(filepath.Separator))) {
+			continue
+		}
+		sortedFiles = append(sortedFiles, info)
+	}
+
+	sort.Slice(sortedFiles, func(i, j int) bool {
+		return strings.Compare(sortedFiles[i].Path, sortedFiles[j].Path) < 0
+	})
+
+	// Process files in parallel using errgroup
+	var eg errgroup.Group
+	if maxConcurrency > 0 {
+		eg.SetLimit(maxConcurrency)
+	} else {
+		eg.SetLimit(runtime.GOMAXPROCS(0))
+	}
+
+	for _, info := range sortedFiles {
+		info := info // capture loop variable
+		eg.Go(func() error {
+			return handle(info)
+		})
+	}
+
+	return eg.Wait()
 }
 
 // ParseTypes parse types

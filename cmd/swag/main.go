@@ -45,6 +45,7 @@ const (
 	stateFlag                = "state"
 	parseFuncBodyFlag        = "parseFuncBody"
 	parseGoPackagesFlag      = "parseGoPackages"
+	maxFileParallelismFlag   = "maxFileParallelism"
 )
 
 var initFlags = []cli.Flag{
@@ -196,6 +197,12 @@ var initFlags = []cli.Flag{
 		Name:  parseGoPackagesFlag,
 		Usage: "Parse Go sources by golang.org/x/tools/go/packages, disabled by default",
 	},
+	&cli.IntFlag{
+		Name:    maxFileParallelismFlag,
+		Aliases: []string{"mfp"},
+		Value:   0,
+		Usage:   "Max concurrent files during operation parsing. 0=sequential (default), -1=auto (GOMAXPROCS), N=limit to N workers",
+	},
 }
 
 func initAction(ctx *cli.Context) error {
@@ -280,6 +287,7 @@ func initAction(ctx *cli.Context) error {
 		State:               ctx.String(stateFlag),
 		ParseFuncBody:       ctx.Bool(parseFuncBodyFlag),
 		ParseGoPackages:     ctx.Bool(parseGoPackagesFlag),
+		MaxFileParallelism:  ctx.Int(maxFileParallelismFlag),
 	})
 }
 

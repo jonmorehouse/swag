@@ -155,6 +155,13 @@ type Config struct {
 
 	// ParseGoPackages whether swag use golang.org/x/tools/go/packages to parse source.
 	ParseGoPackages bool
+
+	// MaxFileParallelism controls concurrent file processing during operation parsing
+	// Values:
+	//   0 = sequential (default, backward compatible)
+	//  -1 = auto (uses runtime.GOMAXPROCS(0))
+	//   N = limit to N concurrent files
+	MaxFileParallelism int
 }
 
 // Build builds swagger json file  for given searchDir and mainAPIFile. Returns json.
@@ -228,7 +235,13 @@ func (g *Gen) Build(config *Config) error {
 	p.ParseFuncBody = config.ParseFuncBody
 	p.ParseGoPackages = config.ParseGoPackages
 
-	if err := p.ParseAPIMultiSearchDir(searchDirs, config.MainAPIFile, config.ParseDepth); err != nil {
+	// Validate and normalize parallelism config
+	fileParallelism := config.MaxFileParallelism
+	if fileParallelism < -1 {
+		return fmt.Errorf("maxFileParallelism must be >= -1 (use -1 for auto, 0 for sequential, N for limit)")
+	}
+
+	if err := p.ParseAPIMultiSearchDirWithConcurrency(searchDirs, config.MainAPIFile, config.ParseDepth, fileParallelism); err != nil {
 		return err
 	}
 
